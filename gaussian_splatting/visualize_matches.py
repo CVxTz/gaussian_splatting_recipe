@@ -8,21 +8,12 @@ from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 
 def get_all_pairs(matches_path: Path) -> list[tuple[str, str]]:
-    """
-    Parse the HDF5 matches file to retrieve all pairs of matched images.
-
-    Args:
-        matches_path: Path to the matches.h5 file.
-
-    Returns:
-        A list of tuples, where each tuple contains the names of a matched image pair.
-    """
     pairs = []
     with h5py.File(matches_path, 'r') as f:
         for img0 in f.keys():
@@ -32,19 +23,6 @@ def get_all_pairs(matches_path: Path) -> list[tuple[str, str]]:
 
 
 def load_keypoints(features_path: Path, image_name: str) -> np.ndarray:
-    """
-    Load keypoints for a specific image from the HDF5 features file.
-
-    Args:
-        features_path: Path to the features.h5 file.
-        image_name: Name of the image.
-
-    Returns:
-        An array of keypoints of shape (N, 2).
-
-    Raises:
-        KeyError: If the image name is not found in the features file.
-    """
     with h5py.File(features_path, 'r') as f:
         if image_name not in f:
             raise KeyError(f"Image {image_name} not found in {features_path}")
@@ -52,24 +30,11 @@ def load_keypoints(features_path: Path, image_name: str) -> np.ndarray:
 
 
 def load_matches(matches_path: Path, img0_name: str, img1_name: str) -> tuple[np.ndarray, bool]:
-    """
-    Load matches between two images from the HDF5 matches file.
-
-    Args:
-        matches_path: Path to the matches.h5 file.
-        img0_name: Name of the first image.
-        img1_name: Name of the second image.
-
-    Returns:
-        A tuple containing the matches array and a boolean indicating if the
-        images were swapped in the HDF5 hierarchy.
-
-    Raises:
-        KeyError: If the match pair is not found in the matches file.
-    """
     with h5py.File(matches_path, 'r') as f:
+        # Check standard order
         if img0_name in f and img1_name in f[img0_name]:
             return f[img0_name][img1_name]['matches0'][:], False
+        # Check swapped order
         if img1_name in f and img0_name in f[img1_name]:
             return f[img1_name][img0_name]['matches0'][:], True
 
@@ -82,24 +47,14 @@ def visualize_pair(
         matches_path: Path,
         img0_name: str,
         img1_name: str,
-        output_path: Path
+        output_path: Path,
+        max_matches: int = 50
 ) -> None:
-    """
-    Visualize matched keypoints between two images and save the result.
+    logger.info("=" * 60)
+    logger.info(f"DIAGNOSTICS FOR PAIR: {img0_name} <-> {img1_name}")
+    logger.info("=" * 60)
 
-    Args:
-        image_dir: Directory containing the images.
-        features_path: Path to the HDF5 features file.
-        matches_path: Path to the HDF5 matches file.
-        img0_name: Filename of the first image.
-        img1_name: Filename of the second image.
-        output_path: Path to save the visualization image.
-
-    Raises:
-        FileNotFoundError: If the physical image files cannot be loaded.
-    """
-    logger.info(f"Visualizing matches between {img0_name} and {img1_name}")
-
+    # 1. Load Images & Verify Shapes
     img0_path = image_dir / img0_name
     img1_path = image_dir / img1_name
 
@@ -107,17 +62,32 @@ def visualize_pair(
     img1 = cv2.imread(str(img1_path))
 
     if img0 is None or img1 is None:
-        raise FileNotFoundError("One or both images could not be loaded. Check the image directory and filenames.")
+        raise FileNotFoundError("One or both images could not be loaded.")
 
+    logger.info(f"[IMAGE 0] Loaded {img0_name} | Shape: {img0.shape}")
+    logger.info(f"[IMAGE 1] Loaded {img1_name} | Shape: {img1.shape}")
+
+    # 2. Load Keypoints
     kpts0 = load_keypoints(features_path, img0_name)
     kpts1 = load_keypoints(features_path, img1_name)
 
-    matches, swapped = load_matches(matches_path, img0_name, img1_name)
+    logger.info(f"[KEYPOINTS 0] Loaded from H5 | Shape: {kpts0.shape}")
+    logger.info(f"[KEYPOINTS 1] Loaded from H5 | Shape: {kpts1.shape}")
 
-    cv_kpts0 = [cv2.KeyPoint(x=pt[0], y=pt[1], size=1) for pt in kpts0]
-    cv_kpts1 = [cv2.KeyPoint(x=pt[0], y=pt[1], size=1) for pt in kpts1]
+    # 3. Load Matches & Track Swap Status
+    matches, swapped = load_matches(matches_path, img0_name, img1_name)
+    logger.info(f"[MATCHES] Loaded matches0 array | Shape: {matches.shape} | H5 Swap Status: {swapped}")
+
+    cv_kpts0 = [cv2.KeyPoint(x=float(pt[0]), y=float(pt[1]), size=1) for pt in kpts0]
+    cv_kpts1 = [cv2.KeyPoint(x=float(pt[0]), y=float(pt[1]), size=1) for pt in kpts1]
 
     cv_matches = []
+
+    # ------------------------------------------------------------------------
+    # INDEXING LOGIC
+    # If not swapped: matches[i] = j -> kpts0[i] matches kpts1[j]
+    # If swapped: matches[j] = i -> kpts1[j] matches kpts0[i]
+    # ------------------------------------------------------------------------
     if not swapped:
         for i, j in enumerate(matches):
             if j > -1:
@@ -127,7 +97,23 @@ def visualize_pair(
             if i > -1:
                 cv_matches.append(cv2.DMatch(_queryIdx=i, _trainIdx=j, _distance=0))
 
-    logger.info(f"Found {len(cv_matches)} valid matches.")
+    logger.info(f"[MAPPING] Total valid matches parsed: {len(cv_matches)}")
+
+    # 4. Explicit Sanity Check of the HDF5 Data
+    if cv_matches:
+        logger.info("-" * 40)
+        logger.info("EXACT HDF5 COORDINATE MAPPING (First 5 matches):")
+        for idx, m in enumerate(cv_matches[:5]):
+            pt0 = kpts0[m.queryIdx]
+            pt1 = kpts1[m.trainIdx]
+            logger.info(
+                f"  Match {idx}: [Img 0, Kpt {m.queryIdx}] (x:{pt0[0]:.1f}, y:{pt0[1]:.1f}) ---> [Img 1, Kpt {m.trainIdx}] (x:{pt1[0]:.1f}, y:{pt1[1]:.1f})")
+        logger.info("-" * 40)
+
+    # 5. Limit visualization for readability
+    if len(cv_matches) > max_matches:
+        cv_matches = random.sample(cv_matches, max_matches)
+        logger.info(f"[DRAWING] Sampled down to {max_matches} matches for clean visualization.")
 
     matched_img = cv2.drawMatches(
         img0, cv_kpts0,
@@ -145,49 +131,35 @@ def visualize_pair(
 
 
 def main() -> None:
-    """
-    Main entry point for the visualization script.
-    """
-    parser = argparse.ArgumentParser(description="Visualize random matched keypoints between images.")
-    parser.add_argument("--image_dir", type=Path, required=True, help="Directory containing the extracted images")
+    parser = argparse.ArgumentParser(description="Visualize random matched keypoints.")
+    parser.add_argument("--image_dir", type=Path, required=True, help="Directory containing images")
     parser.add_argument("--features", type=Path, required=True, help="Path to features.h5")
     parser.add_argument("--matches", type=Path, required=True, help="Path to matches.h5")
-    parser.add_argument("--output_dir", type=Path, default=Path("matches_visualizations"),
-                        help="Output directory for visualizations")
-    parser.add_argument("--num_pairs", type=int, default=5, help="Number of random pairs to visualize")
+    parser.add_argument("--output_dir", type=Path, default=Path("matches_visualizations"))
+    parser.add_argument("--num_pairs", type=int, default=5, help="Number of random pairs")
 
     args = parser.parse_args()
 
     all_pairs = get_all_pairs(args.matches)
-
     if not all_pairs:
-        logger.error("No matches found in the provided HDF5 file.")
+        logger.error("No matches found in the HDF5 file.")
         return
 
     num_to_sample = min(args.num_pairs, len(all_pairs))
     selected_pairs = random.sample(all_pairs, num_to_sample)
 
-    logger.info(f"Randomly selected {num_to_sample} pairs for visualization.")
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
     for idx, (img0, img1) in enumerate(selected_pairs):
         clean_img0 = img0.replace(".jpg", "").replace(".png", "")
         clean_img1 = img1.replace(".jpg", "").replace(".png", "")
         out_filename = f"match_{idx:03d}_{clean_img0}_to_{clean_img1}.jpg"
-        out_path = args.output_dir / out_filename
 
         try:
             visualize_pair(
-                args.image_dir,
-                args.features,
-                args.matches,
-                img0,
-                img1,
-                out_path
+                args.image_dir, args.features, args.matches,
+                img0, img1, args.output_dir / out_filename
             )
         except Exception as e:
-            logger.error(f"Failed to visualize pair {img0} and {img1}: {e}")
+            logger.error(f"Failed to visualize pair {img0} & {img1}: {e}")
 
 
 if __name__ == "__main__":
