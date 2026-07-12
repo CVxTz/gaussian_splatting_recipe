@@ -1,10 +1,11 @@
 import argparse
 import logging
 import random
+from pathlib import Path
+
 import cv2
 import h5py
 import numpy as np
-from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,

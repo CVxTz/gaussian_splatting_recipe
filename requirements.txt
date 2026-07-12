@@ -1,4 +1,7 @@
 pycolmap==4.0.4
-opencv-python
-h5py
-transformers
+opencv-python==5.0.0.93
+h5py==3.16.0
+transformers==5.13.1
+gsplat==1.5.3
+plyfile==1.1.4
+imageio-ffmpeg==0.6.0

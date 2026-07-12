@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+    <title>SuperSplat Viewer</title>
+    <style>
+        html, body {
+            margin: 0;
+            height: 100%;
+            width: 100%;
+            background-color: black;
+            overflow: hidden;
+        }
+
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            outline: none;
+            touch-action: none;
+        }
+
+        /* Styles for the drag and drop overlay */
+        #drop-zone {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.75);
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: sans-serif;
+            font-size: 2rem;
+            font-weight: bold;
+            z-index: 2000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s ease;
+        }
+
+        #drop-zone.active {
+            opacity: 1;
+        }
+    </style>
+    <script type="importmap">
+        {
+          "imports": {
+            "playcanvas": "https://cdn.jsdelivr.net/npm/playcanvas/+esm",
+            "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+          }
+        }
+    </script>
+</head>
+<body>
+<!-- Drag & Drop Overlay -->
+<div id="drop-zone">Drop PLY file here</div>
+
+<script type="module">
+    import {
+        Application,
+        Asset,
+        AssetListLoader,
+        Entity,
+        FILLMODE_FILL_WINDOW,
+        RESOLUTION_AUTO,
+        Color
+    } from 'playcanvas';
+    import {GUI} from "lil-gui";
+
+    // 1. Create and append the canvas
+    const canvas = document.createElement('canvas');
+    document.body.appendChild(canvas);
+
+    // 2. Initialize the PlayCanvas Engine (the core of SuperSplat)
+    const app = new Application(canvas, {
+        graphicsDeviceOptions: {antialias: true, alpha: false}
+    });
+
+    // Automatically fill the window and use device pixel ratio for sharp rendering
+    app.setCanvasFillMode(FILLMODE_FILL_WINDOW);
+    app.setCanvasResolution(RESOLUTION_AUTO);
+    app.start();
+
+    // Handle Window Resizing
+    window.addEventListener('resize', () => app.resizeCanvas());
+
+    // 3. Load SuperSplat Camera Controls from the PlayCanvas CDN
+    const assets = [
+        new Asset('camera-controls', 'script', {url: 'https://cdn.jsdelivr.net/npm/playcanvas/scripts/esm/camera-controls.mjs'})
+    ];
+    const loader = new AssetListLoader(assets, app.assets);
+    await new Promise(resolve => loader.load(resolve));
+
+    // 4. Create the Camera
+    const camera = new Entity('Camera');
+    camera.setPosition(0, 0, 5);
+    camera.addComponent('camera', {
+        clearColor: new Color(0, 0, 0, 1) // Pure black background
+    });
+    camera.addComponent('script');
+    camera.script.create('cameraControls'); // Attach the orbit controls
+    app.root.addChild(camera);
+
+    let currentSplat = null;
+
+    // 5. Centralized File Processing Logic
+    async function processFile(file) {
+        if (!file) return;
+
+        const url = URL.createObjectURL(file);
+
+        // Clean up the previously loaded splat if one exists
+        if (currentSplat) {
+            currentSplat.destroy();
+            currentSplat = null;
+        }
+
+        // Tell PlayCanvas to load this as a 'gsplat' asset type
+        const asset = new Asset(file.name, 'gsplat', {url: url});
+        app.assets.add(asset);
+
+        // Once the asset is fully loaded and parsed into memory
+        asset.once('load', () => {
+            const splat = new Entity('GaussianSplat');
+
+            // Add the PlayCanvas Gaussian Splat component
+            splat.addComponent('gsplat', {asset: asset});
+
+            // PlayCanvas defaults to looking down the -Z axis, so we apply a 180 flip
+            // to orient standard 3DGS PLY files right-side up.
+            splat.setEulerAngles(0, 0, 180);
+            splat.setPosition(0, 0, 0);
+
+            app.root.addChild(splat);
+            currentSplat = splat;
+            console.log("Loaded file successfully:", file.name);
+        });
+
+        asset.once('error', (err) => {
+            console.error("Error loading splat:", err);
+            alert("Failed to load file. PlayCanvas supports standard PLY files.");
+        });
+
+        app.assets.load(asset);
+    }
+
+    // Drag and Drop Event Listeners
+    const dropZone = document.getElementById("drop-zone");
+
+    window.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        dropZone.classList.add("active");
+    });
+
+    window.addEventListener("dragleave", (e) => {
+        e.preventDefault();
+        if (e.relatedTarget === null) {
+            dropZone.classList.remove("active");
+        }
+    });
+
+    window.addEventListener("drop", (e) => {
+        e.preventDefault();
+        dropZone.classList.remove("active");
+
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+            processFile(e.dataTransfer.files[0]);
+        }
+    });
+
+    // GUI Menu for manual uploading
+    const gui = new GUI();
+    const ioOptions = {
+        loadFile: () => {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.ply,.sog';
+            input.onchange = (e) => {
+                processFile(e.target.files[0]);
+            };
+            input.click();
+        }
+    };
+
+    const ioFolder = gui.addFolder("I/O");
+    ioFolder.add(ioOptions, "loadFile").name("Load Splats (PLY)");
+    ioFolder.open();
+
+</script>
+</body>
+</html>
