@@ -1,6 +1,8 @@
 
 ## Open-Source Gaussian Splatting with a Beginner Drone
 
+![rendered_flythrough_small.gif](../images/rendered_flythrough_small.gif)
+
 ### What is Gaussian Splatting?
 
 Gaussian splatting is an alternative to traditional 3D polygon meshes. Instead of building surfaces out of polygons, it represents a physical space using millions of tiny 3D points (Gaussians) that blend together to create photorealistic models. It is fast, highly compute-efficient, and powerful enough for high-end VFX. This guide skips the heavy math and gives developers and hobbyists the raw intuition needed to build these pipelines from scratch.
