@@ -114,6 +114,10 @@ def get_colmap_cameras(sparse_dir: Path):
     base_cam = recon.cameras[images[0].camera_id]
     width, height = int(base_cam.width), int(base_cam.height)
 
+    # Force dimensions to be even for FFmpeg libx264 compatibility
+    width -= width % 2
+    height -= height % 2
+
     if base_cam.model_name in ["PINHOLE", "OPENCV", "OPENCV_FISHEYE"]:
         fx, fy = base_cam.params[0], base_cam.params[1]
         cx, cy = base_cam.params[2], base_cam.params[3]

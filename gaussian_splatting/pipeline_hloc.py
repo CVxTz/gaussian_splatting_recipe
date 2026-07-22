@@ -1,5 +1,6 @@
 import argparse
 import logging
+import shutil
 from pathlib import Path
 
 import cv2
@@ -8,7 +9,7 @@ import pycolmap
 import torch
 from transformers import AutoProcessor, GroundingDinoForObjectDetection
 
-from hloc import extract_features, match_features, reconstruction
+from hloc import extract_features, match_features, reconstruction, pairs_from_retrieval
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,29 +125,62 @@ def generate_sequential_pairs(image_dir: Path, output_path: Path, overlap: int =
     logger.info(f"Generated {len(pairs)} sequential pairs from {len(images)} images (Overlap: {overlap}).")
 
 
-def run_hloc_pipeline(image_dir: Path, output_dir: Path, mask_dir: Path) -> Path:
+def run_hloc_pipeline(image_dir: Path, output_dir: Path, mask_dir: Path, feature_type: str = "disk",
+                      estimate_distortion: bool = False, retrieval_model: str = None, num_retrieved: int = 50) -> Path:
     outputs = output_dir / "hloc_outputs"
     outputs.mkdir(parents=True, exist_ok=True)
 
-    sfm_pairs = outputs / "pairs-sequence.txt"
     sfm_dir = outputs / "sfm"
-    features = outputs / "features.h5"
-    matches = outputs / "matches.h5"
+    features = outputs / f"features_{feature_type}.h5"
+    matches = outputs / f"matches_{feature_type}.h5"
 
-    feature_conf = extract_features.confs['superpoint_aachen']
-    matcher_conf = match_features.confs['superpoint+lightglue']
+    if retrieval_model:
+        # Prevent silent KeyErrors by verifying the model exists in your current hloc installation
+        if retrieval_model not in extract_features.confs:
+            available = [k for k in extract_features.confs.keys()]
+            raise ValueError(f"Retrieval model '{retrieval_model}' is not supported by your installed version of hloc. "
+                             f"Available configurations in your environment are: {available}")
+        sfm_pairs = outputs / f"pairs-retrieval_{retrieval_model}.txt"
+    else:
+        sfm_pairs = outputs / "pairs-sequence.txt"
 
-    logger.info("Step 1/4: Extracting features with SuperPoint...")
+    # Dynamically map the chosen feature type to the correct HLOC configs
+    if feature_type == 'superpoint':
+        feature_conf = extract_features.confs['superpoint_max']
+        matcher_conf = match_features.confs['superpoint+lightglue']
+    elif feature_type == 'disk':
+        feature_conf = extract_features.confs['disk']
+        matcher_conf = match_features.confs['disk+lightglue']
+    elif feature_type == 'aliked':
+        feature_conf = extract_features.confs['aliked']
+        matcher_conf = match_features.confs['aliked+lightglue']
+    else:
+        raise ValueError(f"Unsupported feature type: {feature_type}")
+
+    logger.info(f"Step 1/5: Extracting features with {feature_type.upper()}...")
     extract_features.main(feature_conf, image_dir, image_list=None, feature_path=features)
 
-    logger.info("Step 2/4: Generating custom sequential pairs...")
-    generate_sequential_pairs(image_dir, sfm_pairs, overlap=50)
+    if retrieval_model:
+        logger.info(f"Step 2/5: Shortlisting pairs using retrieval model ({retrieval_model})...")
+        retrieval_conf = extract_features.confs[retrieval_model]
+        global_features = outputs / f"global_features_{retrieval_model}.h5"
 
-    logger.info("Step 3/4: Matching features with LightGlue...")
-    # LightGlue will naturally only match the keypoints that survived our filtering
+        # Extract global descriptors
+        extract_features.main(retrieval_conf, image_dir, image_list=None, feature_path=global_features)
+
+        # Generate pairs matching the top N candidates
+        pairs_from_retrieval.main(global_features, sfm_pairs, num_matched=num_retrieved)
+    else:
+        logger.info("Step 2/5: Generating custom sequential pairs...")
+        generate_sequential_pairs(image_dir, sfm_pairs, overlap=50)
+
+    logger.info(f"Step 3/5: Matching features with LightGlue ({feature_type})...")
     match_features.main(matcher_conf, sfm_pairs, features=features, matches=matches)
 
-    logger.info("Step 4/4: Running COLMAP reconstruction (Forcing SINGLE PINHOLE camera)...")
+    # Use OPENCV to estimate radial/tangential distortion, or PINHOLE for 0 distortion
+    camera_model = 'OPENCV' if estimate_distortion else 'PINHOLE'
+    logger.info(f"Step 4/5: Running COLMAP reconstruction (Forcing SINGLE {camera_model} camera)...")
+
     reconstruction.main(
         sfm_dir=sfm_dir,
         image_dir=image_dir,
@@ -154,21 +188,55 @@ def run_hloc_pipeline(image_dir: Path, output_dir: Path, mask_dir: Path) -> Path
         features=features,
         matches=matches,
         camera_mode=pycolmap.CameraMode.SINGLE,
-        image_options={'camera_model': 'PINHOLE'}
+        image_options={'camera_model': camera_model}
     )
 
-    logger.info(f"Reconstruction completed successfully. Model saved to {sfm_dir}")
+    if estimate_distortion:
+        logger.info("Step 5/5: Undistorting images and COLMAP model...")
+        undistort_dir = outputs / "undistorted"
+        undistort_dir.mkdir(parents=True, exist_ok=True)
+
+        # Run pycolmap undistortion (outputs 'images' and 'sparse' subdirectories)
+        pycolmap.undistort_images(undistort_dir, sfm_dir, image_dir)
+
+        distorted_sfm_dir = outputs / "sfm_distorted"
+        distorted_image_dir = image_dir.parent / "images_distorted"
+
+        # 1. Backup the original distorted data
+        sfm_dir.rename(distorted_sfm_dir)
+        image_dir.rename(distorted_image_dir)
+
+        # 2. Move undistorted data perfectly into the original paths to satisfy the path constraint
+        shutil.move(str(undistort_dir / "sparse"), str(sfm_dir))
+        shutil.move(str(undistort_dir / "images"), str(image_dir))
+
+        # 3. Clean up temporary directory
+        shutil.rmtree(undistort_dir)
+
+        logger.info(f"Undistortion complete. Undistorted model saved exactly to {sfm_dir} and images to {image_dir}")
+    else:
+        logger.info(f"Reconstruction completed successfully. Model saved to {sfm_dir}")
+
     return sfm_dir
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Extract video frames and run HLOC to output a PINHOLE COLMAP model.")
+    parser = argparse.ArgumentParser(description="Extract video frames and run HLOC to output a COLMAP model.")
     parser.add_argument("--video", type=Path, required=True, help="Input .mp4 video file")
     parser.add_argument("--output_dir", type=Path, required=True, help="Output directory for frames and COLMAP data")
     parser.add_argument("--fps", type=int, default=5, help="Frames per second to extract from the video")
     parser.add_argument("--focus_objects", action="store_true",
                         help="Mask out everything except targets using DINO bboxes")
     parser.add_argument("--prompt", type=str, default="bench. backpack.", help="Text prompt for Grounding DINO")
+    parser.add_argument("--feature_type", type=str, choices=['superpoint', 'disk', 'aliked'], default='disk',
+                        help="Feature extractor to use (disk and aliked are highly recommended for indoor scenes).")
+    parser.add_argument("--estimate_distortion", action="store_true",
+                        help="Estimate lens distortion during SFM and generate an undistorted final model/images.")
+    parser.add_argument("--retrieval_model", type=str, default=None,
+                        choices=['netvlad', 'cosplace', 'megaloc', 'dir', 'openibl'],
+                        help="Optional global feature model to shortlist pairs (e.g., cosplace). If None, uses default sequential proximity pairs.")
+    parser.add_argument("--num_retrieved", type=int, default=50,
+                        help="Number of retrieved matching pairs per image if using a retrieval_model.")
     args = parser.parse_args()
 
     if args.prompt:
@@ -178,7 +246,8 @@ def main() -> None:
     mask_dir = args.output_dir / "masks"
 
     extract_frames(args.video, image_dir, mask_dir, args.fps, args.focus_objects, args.prompt)
-    run_hloc_pipeline(image_dir, args.output_dir, mask_dir)
+    run_hloc_pipeline(image_dir, args.output_dir, mask_dir, args.feature_type, args.estimate_distortion,
+                      args.retrieval_model, args.num_retrieved)
 
 
 if __name__ == "__main__":
